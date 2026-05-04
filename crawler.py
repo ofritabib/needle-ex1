@@ -268,35 +268,103 @@ def save_outputs(df):
     Path("output").mkdir(exist_ok=True)
     df.to_csv("output/books_raw.csv", index=False)
     records = df.to_dict(orient="records")
-    clean = [
-        {k: v for k, v in row.items()
-         if v is not None and v != ""
-         and not (isinstance(v, float) and math.isnan(v))}
-        for row in records
-    ]
+    clean = []
+    for idx, row in enumerate(records, 1):
+        filtered = {k: v for k, v in row.items()
+                    if v is not None and v != ""
+                    and not (isinstance(v, float) and math.isnan(v))}
+        filtered["id"] = str(idx)
+        clean.append(filtered)
     with open("output/books_raw.json", "w", encoding="utf-8") as f:
         json.dump({"records": {"record": clean}}, f, indent=2, ensure_ascii=False)
+
+
+def save_processed_outputs(df):
+    Path("output").mkdir(exist_ok=True)
+
+    df.to_csv("output/books_processed.csv", index=False)
+
+    records = df.to_dict(orient="records")
+    clean = []
+    for idx, row in enumerate(records, 1):
+        filtered = {k: v for k, v in row.items()
+                    if v is not None and v != ""
+                    and not (isinstance(v, float) and math.isnan(v))}
+        filtered["id"] = str(idx)
+        clean.append(filtered)
+
+    with open("output/books_processed.json", "w", encoding="utf-8") as f:
+        json.dump({"records": {"record": clean}}, f, indent=2, ensure_ascii=False)
+
+    print("\n── Books processed preview ──")
+    print(df.head(10).to_string())
+    df.head(10).to_csv("output/books_processed_preview.csv", index=False)
 
 
 def sort_dataframe(df):
     return df.sort_values("Title")
 
 
+def save_sort_samples(df_before, df_after):
+    Path("output").mkdir(exist_ok=True)
+
+    print("\n── Books before sort ──")
+    print(df_before.head(10).to_string())
+    df_before.head(10).to_csv("output/books_before_sort.csv", index=False)
+
+    print("\n── Books after sort ──")
+    print(df_after.head(10).to_string())
+    df_after.head(10).to_csv("output/books_after_sort.csv", index=False)
+
+
 def enrich_dataframe(df):
     df = df.copy()
-    df["isExpensive"]    = df["Price_NIS"] > df["Price_NIS"].median()
-    df["NumberOfAuthors"] = np.where(
-        df["Authors"].str.contains(";"),
-        df["Authors"].str.count(";") + 1,
-        df["Authors"].str.count(",") + 1,
+
+    df["IsExpensive"] = np.where(
+        df["Price_NIS"] > df["Price_NIS"].median(),
+        1,
+        0,
     )
+
+    authors = df["Authors"].fillna("").str.strip()
+
+    df["NumberOfAuthors"] = np.where(
+        authors == "",
+        0,
+        np.where(
+            authors.str.contains(";"),
+            authors.str.count(";") + 1,
+            authors.str.count(",") + 1,
+        ),
+    )
+
     return df
 
 
 def calculate_stats(df):
+    Path("output").mkdir(exist_ok=True)
+
+    total_rows = len(df)
+    rows = []
+
     for col in STAT_COLS:
-        print(f"\n── {col} ──")
-        print(df[col].dropna().describe().to_string())
+        values = df[col].dropna()
+
+        rows.append({
+            "Column": col,
+            "TotalRows": total_rows,
+            "CountWithValue": values.count(),
+            "Mean": values.mean(),
+            "Std": values.std(),
+            "Min": values.min(),
+            "Max": values.max(),
+            "Median": values.median(),
+        })
+
+    summary = pd.DataFrame(rows)
+    print("\n── Summary statistics ──")
+    print(summary.to_string(index=False))
+    summary.to_csv("output/books_summary.csv", index=False)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -310,8 +378,10 @@ def main():
     print(f"\nDone. {len(records)} books crawled.")
     df         = build_dataframe(records)
     save_outputs(df)
-    df         = sort_dataframe(df)
-    df         = enrich_dataframe(df)
+    df_sorted  = sort_dataframe(df)
+    save_sort_samples(df, df_sorted)
+    df         = enrich_dataframe(df_sorted)
+    save_processed_outputs(df)
     calculate_stats(df)
 
 
