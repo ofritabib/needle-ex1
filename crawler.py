@@ -100,120 +100,70 @@ def get_next_page_url(soup):
         return href
     return None
 
-
-def parse_book(soup, category_name):
-    result = {}
-
-    title = ""
-    for script in soup.find_all("script", type="application/ld+json"):
+def get_product_info_json(soup):
+    product_info = {}
+    for script in soup.find_all('script', type='application/ld+json'):
         try:
-            d = json.loads(script.string)
-            if d.get("@type") == "Product":
-                title = d.get("name", "").strip()
-                break
+            info = json.loads(script.string)
         except Exception:
-            pass
-    if not title:
-        h1 = soup.find("h1")
-        title = h1.get_text(strip=True) if h1 else ""
-    result["Title"] = title
-    result["Category"] = category_name
+            continue
+        if info.get('@type') == 'Product':
+            product_info["Title"] = info["name"].strip()
+            product_info["url"] = info["url"].strip()
+            product_info["ISBN"] = info.get("isbn")
+            product_info["Synopsis"] = info.get("description", "").strip()
+            product_info["Synopsis_length"] = len(product_info["Synopsis"])
 
+            prices = [float(o["price"]) for o in info.get("offers", []) if o.get("priceCurrency") == "ILS"]
+            if prices:
+                product_info["Price_NIS"] = min(prices)
+                product_info["Price_USD"] = ceil2(product_info["Price_NIS"] / USD_RATE)
+                
+            
+            ratings = [r.get("reviewRating", {}).get("ratingValue") for r in info.get("review", []) if r.get("@type") == "Review"]
+            ratings = [float(r) for r in ratings if r is not None]
+            product_info["NumberOfReviews"] = len(ratings)
+            if product_info["NumberOfReviews"] > 0:
+                product_info["StarRating"] = np.mean(ratings)
+            break
+    return product_info
+
+def get_metadata_by_key(info, key):
+    element = info.find(id=key)
+    if element:
+        return element.get_text(separator=",", strip=True)
+    return None
+
+
+def get_product_info_div(soup):
+    result = {}
     info = soup.find("div", class_="product-info")
-    left_col = info.find("div", class_="col-md-3") if info else None
-    left_text = left_col.get_text(separator="\n", strip=True) if left_col else ""
 
-    skip_re = re.compile(r"view author|ver autor", re.I)
-    authors = []
-    if info:
-        for a in info.find_all("a", href=re.compile(r"/author/")):
-            name = a.get_text(strip=True)
-            if name and not skip_re.search(name):
-                authors.append(name)
-    result["Authors"] = ", ".join(dict.fromkeys(authors))
-
-    cats_start = left_text.find("Categories\n")
-    if cats_start >= 0:
-        cats_text = left_text[cats_start + len("Categories\n"):]
-        cat_lines = [
-            l.strip()
-            for l in cats_text.split("\n")
-            if l.strip() and not l.strip().startswith("(")
-        ]
-        result["Categories"] = ", ".join(cat_lines)
-    else:
-        result["Categories"] = ""
-
-    result["Year"]     = extract_left_field(left_text, "Year")
-    result["Language"] = extract_left_field(left_text, "Language")
-    result["Format"]   = extract_left_field(left_text, "Format")
-
-    dim_raw = extract_left_field(left_text, "Dimensions")
+    if not info:
+        return result
+    result["Categories"] = get_metadata_by_key(info, "metadata-categorías")
+    result["Year"] = get_metadata_by_key(info, "metadata-ano")
+    result["Language"] = get_metadata_by_key(info, "metadata-idioma")
+    result["Format"] = get_metadata_by_key(info, "metadata-encuadernación")
+    result["Authors"] = get_metadata_by_key(info, "metadata-autor")
+    dim_raw = get_metadata_by_key(info, "metadata-dimensiones") or ""
     dim_m = re.match(r"([\d.,\s x]+)\s*(\w+)", dim_raw)
     if dim_m:
         dims = re.findall(r"[\d.]+", dim_m.group(1).replace(",", "."))
         result["Dimensions"]      = ", ".join(dims)
         result["Dimensions_unit"] = dim_m.group(2)
-    else:
-        result["Dimensions"]      = ""
-        result["Dimensions_unit"] = ""
 
-    weight_raw = extract_left_field(left_text, "Weight")
+    weight_raw = get_metadata_by_key(info, "metadata-peso") or ""
     w_m = re.match(r"([\d.,]+)\s*([a-zA-Z]+)", weight_raw)
     if w_m:
         result["Weight"]      = w_m.group(1).replace(",", ".")
         result["Weight_unit"] = w_m.group(2)
-    else:
-        result["Weight"]      = ""
-        result["Weight_unit"] = ""
+    return result
 
-    result["ISBN"] = extract_left_field(left_text, "ISBN13") or extract_left_field(left_text, "ISBN")
-
-    precio = soup.find("strong", class_="precio")
-    if precio:
-        price_str = re.sub(r"[^\d.,]", "", precio.get_text(strip=True)).replace(",", ".")
-        try:
-            nis = float(price_str)
-            result["Price_NIS"] = f"{ceil2(nis):.2f}"
-            result["Price_USD"] = f"{ceil2(nis / USD_RATE):.2f}"
-        except ValueError:
-            result["Price_NIS"] = ""
-            result["Price_USD"] = ""
-    else:
-        result["Price_NIS"] = ""
-        result["Price_USD"] = ""
-
-    syn_h = soup.find("h2", string=re.compile(r"Synopsis", re.I))
-    synopsis = ""
-    if syn_h:
-        nxt = syn_h.find_next_sibling()
-        if nxt:
-            synopsis = nxt.get_text(strip=True)
-    result["Synopsis"]        = synopsis
-    result["Synopsis_length"] = len(synopsis)
-
-    star_rating = "None"
-    n_reviews   = 0
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            d = json.loads(script.string)
-            if d.get("@type") == "Product" and "review" in d:
-                reviews = d["review"]
-                n_reviews = len(reviews)
-                if n_reviews > 0:
-                    dist = Counter(
-                        int(r["reviewRating"]["ratingValue"])
-                        for r in reviews
-                        if "reviewRating" in r
-                    )
-                    total    = sum(dist.values())
-                    weighted = sum(stars * count for stars, count in dist.items())
-                    star_rating = f"{ceil2(weighted / total):.2f}"
-        except Exception:
-            pass
-    result["StarRating"]      = star_rating
-    result["NumberOfReviews"] = n_reviews
-
+def parse_book(soup, category_name):
+    result = {"Category": category_name}
+    result |= get_product_info_json(soup)
+    result |= get_product_info_div(soup)
     return result
 
 
@@ -243,7 +193,6 @@ def crawl_all(driver, categories):
                     book  = parse_book(bsoup, cat_name)
                     book["url"] = book_url
                     all_books.append(book)
-                    print(f"      OK: {book['Title'][:60]}")
                 except Exception as e:
                     print(f"      ERR {book_url}: {e}")
 
@@ -255,12 +204,9 @@ def crawl_all(driver, categories):
 
 def build_dataframe(records):
     df = pd.DataFrame(records)
-    df = df[df["Title"] != ""]
+    df = df[["Title","Category","Authors","Categories","Year","Language","Format","Dimensions","Dimensions_unit","Weight","Weight_unit","ISBN","Price_NIS","Price_USD","Synopsis","Synopsis_length","StarRating","NumberOfReviews","url"]]
     df["Year"]       = df["Year"].replace("", pd.NA).astype(float)
     df["Weight"]     = df["Weight"].replace("", pd.NA).astype(float)
-    df["Price_NIS"]  = df["Price_NIS"].replace("", pd.NA).astype(float)
-    df["Price_USD"]  = df["Price_USD"].replace("", pd.NA).astype(float)
-    df["StarRating"] = df["StarRating"].replace("None", pd.NA).astype(float)
     return df
 
 
