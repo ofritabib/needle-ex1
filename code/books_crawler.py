@@ -1,0 +1,335 @@
+import gzip
+import hashlib
+import json
+import math
+import re
+import time
+from collections import Counter
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.support.ui import WebDriverWait
+
+BASE_URL  = "https://www.bookdelivery.com"
+HOME_URL  = f"{BASE_URL}/il-en/"
+DELAY     = 1
+MAX_PAGES = 5
+USD_RATE  = 3.01
+CACHE_DIR = Path(".cache")
+WAF_TITLES = {"", "Human Verification"}
+STAT_COLS  = ["Year", "Price_USD", "StarRating", "NumberOfReviews", "NumberOfAuthors"]
+
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+
+def ceil2(x):
+    return math.ceil(x * 100) / 100
+
+
+def extract_left_field(left_text, label):
+    m = re.search(
+        rf"^{re.escape(label)}\n(.+?)(?=^[A-Za-z]|\Z)",
+        left_text,
+        re.DOTALL | re.MULTILINE,
+    )
+    return m.group(1).strip() if m else ""
+
+
+# ── Driver / fetch ────────────────────────────────────────────────────────────
+
+def init_driver():
+    options = Options()
+    options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+    )
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+    return webdriver.Chrome(service=Service(), options=options)
+
+
+def fetch(url, driver):
+    CACHE_DIR.mkdir(exist_ok=True)
+    cache_file = CACHE_DIR / hashlib.md5(url.encode()).hexdigest()
+    if cache_file.is_file():
+        with gzip.open(cache_file, "rt", encoding="utf-8") as f:
+            return BeautifulSoup(f, "lxml")
+    time.sleep(DELAY)
+    driver.get(url)
+    WebDriverWait(driver, 15).until(lambda d: d.title not in WAF_TITLES)
+    soup = BeautifulSoup(driver.page_source, "lxml")
+    with gzip.open(cache_file, "wt", encoding="utf-8") as f:
+        f.write(str(soup))
+    return soup
+
+
+# ── Crawl helpers ─────────────────────────────────────────────────────────────
+
+def get_categories(soup):
+    cats = []
+    for a in soup.select(".categories a"):
+        href = a.get("href", "")
+        name = a.get_text(strip=True)
+        if href and name:
+            cats.append((name, href))
+    return cats
+
+
+def get_book_links(soup):
+    links = set()
+    for a in soup.select('a[href*="/il-en/book-"]'):
+        href = a["href"]
+        if not href.startswith("http"):
+            href = BASE_URL + href
+        links.add(href)
+    return links
+
+
+def get_next_page_url(soup):
+    next_a = soup.find("a", string=re.compile(r"Next\s*Page", re.I))
+    if next_a and next_a.get("href"):
+        href = next_a["href"]
+        if not href.startswith("http"):
+            href = BASE_URL + href
+        return href
+    return None
+
+def get_product_info_json(soup):
+    product_info = {}
+    for script in soup.find_all('script', type='application/ld+json'):
+        try:
+            info = json.loads(script.string)
+        except Exception:
+            continue
+        if info.get('@type') == 'Product':
+            product_info["Title"] = info["name"].strip()
+            product_info["url"] = info["url"].strip()
+            product_info["ISBN"] = info.get("isbn")
+            product_info["Synopsis"] = info.get("description", "").strip()
+            product_info["Synopsis_length"] = len(product_info["Synopsis"])
+
+            prices = [float(o["price"]) for o in info.get("offers", []) if o.get("priceCurrency") == "ILS"]
+            if prices:
+                product_info["Price_NIS"] = min(prices)
+                product_info["Price_USD"] = ceil2(product_info["Price_NIS"] / USD_RATE)
+                
+            
+            ratings = [r.get("reviewRating", {}).get("ratingValue") for r in info.get("review", []) if r.get("@type") == "Review"]
+            ratings = [float(r) for r in ratings if r is not None]
+            product_info["NumberOfReviews"] = len(ratings)
+            if product_info["NumberOfReviews"] > 0:
+                product_info["StarRating"] = np.mean(ratings)
+            break
+    return product_info
+
+def get_metadata_by_key(info, key):
+    element = info.find(id=key)
+    if element:
+        return element.get_text(separator=",", strip=True)
+    return None
+
+
+def get_product_info_div(soup):
+    result = {}
+    info = soup.find("div", class_="product-info")
+
+    if not info:
+        return result
+    result["Categories"] = get_metadata_by_key(info, "metadata-categorías")
+    result["Year"] = get_metadata_by_key(info, "metadata-ano")
+    result["Language"] = get_metadata_by_key(info, "metadata-idioma")
+    result["Format"] = get_metadata_by_key(info, "metadata-encuadernación")
+    result["Authors"] = get_metadata_by_key(info, "metadata-autor")
+    dim_raw = get_metadata_by_key(info, "metadata-dimensiones") or ""
+    dim_m = re.match(r"([\d.,\s x]+)\s*(\w+)", dim_raw)
+    if dim_m:
+        dims = re.findall(r"[\d.]+", dim_m.group(1).replace(",", "."))
+        result["Dimensions"]      = ", ".join(dims)
+        result["Dimensions_unit"] = dim_m.group(2)
+
+    weight_raw = get_metadata_by_key(info, "metadata-peso") or ""
+    w_m = re.match(r"([\d.,]+)\s*([a-zA-Z]+)", weight_raw)
+    if w_m:
+        result["Weight"]      = w_m.group(1).replace(",", ".")
+        result["Weight_unit"] = w_m.group(2)
+    return result
+
+def parse_book(soup, category_name):
+    result = {"Category": category_name}
+    result |= get_product_info_json(soup)
+    result |= get_product_info_div(soup)
+    return result
+
+
+# ── Pipeline stages ───────────────────────────────────────────────────────────
+
+def crawl_all(driver, categories):
+    all_books    = []
+    visited_books = set()
+
+    for cat_name, cat_url in categories:
+        print(f"\n=== Category: {cat_name} ===")
+        page_url = cat_url
+        page_num = 1
+
+        while page_url and (MAX_PAGES is None or page_num <= MAX_PAGES):
+            print(f"  Page {page_num}: {page_url}")
+            cat_soup   = fetch(page_url, driver)
+            book_links = get_book_links(cat_soup)
+            print(f"    {len(book_links)} book links found")
+
+            for book_url in book_links:
+                if book_url in visited_books:
+                    continue
+                visited_books.add(book_url)
+                try:
+                    bsoup = fetch(book_url, driver)
+                    book  = parse_book(bsoup, cat_name)
+                    book["url"] = book_url
+                    all_books.append(book)
+                except Exception as e:
+                    print(f"      ERR {book_url}: {e}")
+
+            page_url = get_next_page_url(cat_soup)
+            page_num += 1
+
+    return all_books
+
+
+def build_dataframe(records):
+    df = pd.DataFrame(records)
+    df = df[["Title","Category","Authors","Categories","Year","Language","Format","Dimensions","Dimensions_unit","Weight","Weight_unit","ISBN","Price_NIS","Price_USD","Synopsis","Synopsis_length","StarRating","NumberOfReviews","url"]]
+    df["Year"]       = df["Year"].replace("", pd.NA).astype(float)
+    df["Weight"]     = df["Weight"].replace("", pd.NA).astype(float)
+    return df
+
+
+def save_outputs(df):
+    Path("output").mkdir(exist_ok=True)
+    df.to_csv("output/books_raw.csv", index=False)
+    records = df.to_dict(orient="records")
+    clean = []
+    for idx, row in enumerate(records, 1):
+        filtered = {k: v for k, v in row.items()
+                    if v is not None and v != ""
+                    and not (isinstance(v, float) and math.isnan(v))}
+        filtered["id"] = str(idx)
+        clean.append(filtered)
+    with open("output/books_raw.json", "w", encoding="utf-8") as f:
+        json.dump({"records": {"record": clean}}, f, indent=2, ensure_ascii=False)
+
+
+def save_processed_outputs(df):
+    Path("output").mkdir(exist_ok=True)
+
+    df.to_csv("output/books_processed.csv", index=False)
+
+    records = df.to_dict(orient="records")
+    clean = []
+    for idx, row in enumerate(records, 1):
+        filtered = {k: v for k, v in row.items()
+                    if v is not None and v != ""
+                    and not (isinstance(v, float) and math.isnan(v))}
+        filtered["id"] = str(idx)
+        clean.append(filtered)
+
+    with open("output/books_processed.json", "w", encoding="utf-8") as f:
+        json.dump({"records": {"record": clean}}, f, indent=2, ensure_ascii=False)
+
+    print("\n── Books processed preview ──")
+    print(df.head(10).to_string())
+    df.head(10).to_csv("output/books_processed_preview.csv", index=False)
+
+
+def sort_dataframe(df):
+    return df.sort_values("Title")
+
+
+def save_sort_samples(df_before, df_after):
+    Path("output").mkdir(exist_ok=True)
+
+    print("\n── Books before sort ──")
+    print(df_before.head(10).to_string())
+    df_before.head(10).to_csv("output/books_before_sort.csv", index=False)
+
+    print("\n── Books after sort ──")
+    print(df_after.head(10).to_string())
+    df_after.head(10).to_csv("output/books_after_sort.csv", index=False)
+
+
+def enrich_dataframe(df):
+    df = df.copy()
+
+    df["IsExpensive"] = np.where(
+        df["Price_NIS"] > df["Price_NIS"].median(),
+        1,
+        0,
+    )
+
+    authors = df["Authors"].fillna("").str.strip()
+
+    df["NumberOfAuthors"] = np.where(
+        authors == "",
+        0,
+        np.where(
+            authors.str.contains(";"),
+            authors.str.count(";") + 1,
+            authors.str.count(",") + 1,
+        ),
+    )
+
+    return df
+
+
+def calculate_stats(df):
+    Path("output").mkdir(exist_ok=True)
+
+    total_rows = len(df)
+    rows = []
+
+    for col in STAT_COLS:
+        values = df[col].dropna()
+
+        rows.append({
+            "Column": col,
+            "TotalRows": total_rows,
+            "CountWithValue": values.count(),
+            "Mean": values.mean(),
+            "Std": values.std(),
+            "Min": values.min(),
+            "Max": values.max(),
+            "Median": values.median(),
+        })
+
+    summary = pd.DataFrame(rows)
+    print("\n── Summary statistics ──")
+    print(summary.to_string(index=False))
+    summary.to_csv("output/books_summary.csv", index=False)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    driver     = init_driver()
+    home_soup  = fetch(HOME_URL, driver)
+    categories = get_categories(home_soup)
+    print(f"Found {len(categories)} categories")
+    records    = crawl_all(driver, categories)
+    print(f"\nDone. {len(records)} books crawled.")
+    df         = build_dataframe(records)
+    save_outputs(df)
+    df_sorted  = sort_dataframe(df)
+    save_sort_samples(df, df_sorted)
+    df         = enrich_dataframe(df_sorted)
+    save_processed_outputs(df)
+    calculate_stats(df)
+
+
+if __name__ == "__main__":
+    main()
